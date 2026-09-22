@@ -1,0 +1,29 @@
+import cv2
+import supervision as sv
+from inference.models import YOLOWorld # Or GroundingDINO depending on your setup
+
+# 1. Initialize the Grounding DINO model
+from inference.models.grounding_dino import GroundingDINO
+model = GroundingDINO(api_key="YOUR_ROBOFLOW_API_KEY") # Requires a free Roboflow API key
+
+# 2. Load your image and define text prompts
+image_path = "room.jpg"
+image = cv2.imread(image_path)
+prompt = "the black chair . white lamp . wooden table"
+
+# 3. Perform inference
+# box_threshold filters weak detections; text_threshold aligns text tokens
+results = model.infer(image, text_prompt=prompt, box_threshold=0.3, text_threshold=0.25)
+
+# 4. Convert results to Supervision format for easy plotting
+detections = sv.Detections.from_inference(results)
+
+# 5. Annotate and display the image
+box_annotator = sv.BoxAnnotator()
+label_annotator = sv.LabelAnnotator()
+
+annotated_image = box_annotator.annotate(scene=image, detections=detections)
+annotated_image = label_annotator.annotate(scene=annotated_image, detections=detections)
+
+cv2.imshow("Grounding DINO Detections", annotated_image)
+cv2.waitKey(0)
