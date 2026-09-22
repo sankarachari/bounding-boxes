@@ -1,0 +1,99 @@
+import torch
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+
+# Grounding DINO imports
+from groundingdino.util.inference import load_model, load_image, predict
+
+# SAM 2 imports
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+# 1. Configuration & Device Setup
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Paths to your model weights (Make sure you download these checkpoints first)
+dino_config = "groundingdino/config/GroundingDINO_SwinT_OGC.py"
+dino_weights = "weights/groundingdino_swint_ogc.pth"
+sam2_checkpoint = "checkpoints/sam2_hiera_large.pt"
+sam2_model_cfg = "sam2_hiera_l.yaml"
+
+image_path = "workspace_scene.jpg"
+TEXT_PROMPT = "the black coffee mug . computer mouse"
+BOX_THRESHOLD = 0.30
+TEXT_THRESHOLD = 0.25
+
+# 2. Initialize both models
+print("Loading Grounding DINO...")
+dino_model = load_model(dino_config, dino_weights, device=device)
+
+print("Loading SAM 2...")
+sam2_model = build_sam2(sam2_model_cfg, sam2_checkpoint, device=device)
+sam2_predictor = SAM2ImagePredictor(sam2_model)
+
+# 3. Step 1: Run Grounding DINO Object Detection
+# image_source: standard numpy array [H, W, 3]
+# image_tensor: normalized tensor ready for DINO forward pass
+image_source, image_tensor = load_image(image_path)
+
+boxes, logits, phrases = predict(
+    model=dino_model,
+    image=image_tensor,
+    caption=TEXT_PROMPT,
+    box_threshold=BOX_THRESHOLD,
+    text_threshold=TEXT_THRESHOLD,
+    device=device
+)
+
+# 4. Format Conversion: DINO [cx, cy, w, h] normalized -> SAM 2 [xmin, ymin, xmax, ymax] absolute
+h, w, _ = image_source.shape
+boxes_unnorm = boxes * torch.Tensor([w, h, w, h])
+# Convert center coordinates to corner boundaries
+xyxy_boxes = torch.zeros_like(boxes_unnorm)
+xyxy_boxes[:, 0] = boxes_unnorm[:, 0] - boxes_unnorm[:, 2] / 2 # xmin
+xyxy_boxes[:, 1] = boxes_unnorm[:, 1] - boxes_unnorm[:, 3] / 2 # ymin
+xyxy_boxes[:, 2] = boxes_unnorm[:, 0] + boxes_unnorm[:, 2] / 2 # xmax
+xyxy_boxes[:, 3] = boxes_unnorm[:, 1] + boxes_unnorm[:, 3] / 2 # ymax
+
+input_boxes = xyxy_boxes.cpu().numpy()
+
+# 5. Step 2: Feed Boxes into SAM 2 for Segmentation Masks
+print(f"Piping {len(input_boxes)} bounding boxes into SAM 2...")
+# SAM 2 image reader prefers RGB format
+image_rgb = cv2.cvtColor(image_source, cv2.COLOR_BGR2RGB)
+sam2_predictor.set_image(image_rgb)
+
+# Execute batch prompting on all detected boxes at once
+masks, scores, _ = sam2_predictor.predict(
+    box=input_boxes,
+    multimask_output=False # Return the single highest confidence mask per box
+)
+
+# 6. Visualize and Overlay the Segmentations
+# Create a blank overlay canvas for masks
+mask_overlay = np.zeros_like(image_source, dtype=np.uint8)
+
+for i, (mask, label) in enumerate(zip(masks, phrases)):
+    # Compress mask dimensions if necessary [1, H, W] -> [H, W]
+    mask = mask.squeeze()
+    
+    # Generate a unique random color for each object instance
+    color = list(np.random.choice(range(256), size=3))
+    
+    # Draw mask onto overlay
+    mask_overlay[mask] = color
+    
+    # Draw Grounding DINO Box boundaries and label names
+    xmin, ymin, xmax, ymax = map(int, input_boxes[i])
+    cv2.rectangle(image_source, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
+    cv2.putText(image_source, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+# Blend the original image frames and masks together
+alpha = 0.4
+final_output = cv2.addWeighted(mask_overlay, alpha, image_source, 1 - alpha, 0)
+
+# Save result to disk
+cv2.imwrite("dino_sam2_labeled_output.jpg", final_output)
+print("Pipeline complete! Visualized output saved as 'dino_sam2_labeled_output.jpg'")
